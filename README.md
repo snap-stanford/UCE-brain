@@ -15,3 +15,6 @@ We use a dataset on VPA-treated dorsal forebrain organoids dataset ([here](https
 
 The dataset can be downloaded from the cellxgene portal linked above, and the model checkpoint can be obtained from the Hugging Face model hub at `KuanP/uce-brain-pilot-8l-512d` (which should be automatically downloaded when you run the notebook, or downloaded from [here](https://huggingface.co/KuanP/uce-brain-pilot-8l-512d)). The gene mapping JSON file is included in the repository under `gene_data/human_gene_dict.json`.
 
+## Model weights
+- Brain pilot models: `KuanP/uce-brain-pilot-8l-512d` (8 layers, 512 embedding dimension, trained on brain organoid data, [here](https://huggingface.co/KuanP/uce-brain-pilot-8l-512d))
+- cxg2025 models: `KuanP/uce-cxg-2025-baseline-8l-512d` (8 layers, 512 embedding dimension, trained on all data from cxg2025, [here](https://huggingface.co/KuanP/uce-cxg-2025-baseline-8l-512d))

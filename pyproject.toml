@@ -1,0 +1,31 @@
+[project]
+name = "uce-brain"
+version = "0.1.0"
+description = "UCE (Universal Cell Embedding) Brain Model - cell embedding extraction and visualization for single-cell RNA-seq data"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy",
+    "scanpy>=1.12",
+    "scib>=1.1.7",
+    "scikit-learn",
+    "torch",
+    "transformers>=4.57.1",
+    "tqdm",
+    "ipywidgets>=8.1.8",
+    "notebook>=7.5.3",
+    "seaborn",
+    "matplotlib",
+    "jupyterlab>=4.5.5",
+    "pygments>=2.19.2",
+]
+
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-dir]
+"" = "src"

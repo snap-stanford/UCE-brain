@@ -41,6 +41,8 @@ class H5ADDataset(Dataset):
         mask_prop: float = 0.0,
         sample_size: int = 1024,
         cls_token_idx: int = 1,
+        # chrom_token_offset: int = 143574,
+        # chrom_token_right_idx: int = 2,
         chrom_token_offset: int = 1000,
         chrom_token_right_idx: int = 2000,
         pad_token_idx: int = 0,
@@ -48,6 +50,7 @@ class H5ADDataset(Dataset):
         max_cells: Optional[int] = None,
         gene_symbol_column: Optional[str] = None,
         species: str = "human",
+        case_insensitive: bool = False,
     ):
         """
         Initialize the H5AD dataset.
@@ -70,9 +73,38 @@ class H5ADDataset(Dataset):
             max_cells: Optional limit on number of cells to process
             gene_symbol_column: Column in adata.var containing gene symbols (auto-detected if None)
             species: Species of the dataset (e.g., "human", "mouse")
+            case_insensitive: If True, normalize both h5ad gene names and vocab
+                keys to uppercase before matching. Useful for mouse data, where
+                MGI sentence-case symbols (``Gnai3``) need to align with the
+                vocab's uppercase keys (``GNAI3``). Off by default to preserve
+                exact-match behaviour for existing notebooks.
         """
+        self.case_insensitive = case_insensitive
         self.adata = adata
-        self.gene_mapping = gene_mapping[species]
+        # Accept either the full multi-species dict (top-level species keys)
+        # or a pre-indexed species sub-dict (passed for backward compat).
+        # Detect by checking whether ``species`` is a top-level key.
+        if species in gene_mapping:
+            self.gene_mapping = gene_mapping[species]
+            self.species = species
+        elif SPECIES_VOCAB_ALIASES.get(species) in gene_mapping:
+            alias = SPECIES_VOCAB_ALIASES[species]
+            log.info(f"Resolved species alias '{species}' -> '{alias}'")
+            self.gene_mapping = gene_mapping[alias]
+            self.species = alias
+        else:
+            # Heuristic: if values look like gene-info dicts (have
+            # protein_embedding_id), assume gene_mapping is already
+            # pre-indexed for a single species.
+            first_value = next(iter(gene_mapping.values()))
+            if isinstance(first_value, dict) and "protein_embedding_id" in first_value:
+                self.gene_mapping = gene_mapping
+                self.species = species
+            else:
+                raise KeyError(
+                    f"Species '{species}' not in gene_mapping. "
+                    f"Top-level keys: {sorted(gene_mapping.keys())}"
+                )
         self.pad_length = pad_length
         self.positive_sample_num = positive_sample_num
         self.negative_sample_num = negative_sample_num
@@ -108,13 +140,15 @@ class H5ADDataset(Dataset):
         """
         var_names = list(self.adata.var_names)
 
-        is_ensembl = var_names[0].startswith('ENSG') if var_names else False
+        # Any Ensembl-style prefix triggers the symbol lookup: ENSG (human),
+        # ENSMUSG (mouse), ENSMMUG (macaque), ENSCJAG (marmoset), etc.
+        is_ensembl = var_names[0].startswith('ENS') if var_names else False
 
         if not is_ensembl:
             log.info("Using var_names as gene names (already gene symbols)")
             return var_names
 
-        log.info("var_names are Ensembl IDs, looking for gene symbols...")
+        log.info(f"var_names look like Ensembl IDs (e.g. {var_names[0]!r}); looking for gene symbols...")
 
         possible_columns = ['feature_name', 'gene_symbols', 'gene_symbol', 'gene_name', 'symbol', 'name']
         if gene_symbol_column:
@@ -133,20 +167,53 @@ class H5ADDataset(Dataset):
         return var_names
 
     def _create_gene_alignment(self):
-        """Create mapping from h5ad genes to gene_mapping vocabulary."""
+        """Create mapping from h5ad genes to gene_mapping vocabulary.
+
+        Builds parallel arrays:
+          * ``valid_h5ad_indices``: positions in ``self.h5ad_gene_names`` whose
+            symbol is in the vocab (so a row of ``adata.X`` can be sliced).
+          * ``_resolved_gene_keys``: the vocab keys to look up genomic features
+            for. Same length as ``valid_h5ad_indices``. Identical to the h5ad
+            name in literal-match mode; uppercased in case-insensitive mode.
+        """
         log.info("Aligning h5ad genes to gene mapping...")
 
-        self.valid_h5ad_indices = []
+        if self.case_insensitive:
+            # Pre-index the vocab once by uppercase key. If two vocab entries
+            # collapse to the same uppercase key, the last one wins — log a
+            # warning so the user knows.
+            vocab_upper: Dict[str, str] = {}
+            for k in self.gene_mapping.keys():
+                u = k.upper()
+                if u in vocab_upper and vocab_upper[u] != k:
+                    log.warning(
+                        f"case-insensitive collision: vocab keys {vocab_upper[u]!r} "
+                        f"and {k!r} both map to {u!r}; keeping {k!r}"
+                    )
+                vocab_upper[u] = k
+            log.info(f"  Built uppercase lookup for {len(vocab_upper)} vocab entries")
 
-        for h5ad_idx, gene in enumerate(self.h5ad_gene_names):
-            if gene in self.gene_mapping:
-                self.valid_h5ad_indices.append(h5ad_idx)
+            self.valid_h5ad_indices = []
+            self._resolved_gene_keys: List[str] = []
+            for h5ad_idx, gene in enumerate(self.h5ad_gene_names):
+                resolved = vocab_upper.get(gene.upper())
+                if resolved is not None:
+                    self.valid_h5ad_indices.append(h5ad_idx)
+                    self._resolved_gene_keys.append(resolved)
+        else:
+            self.valid_h5ad_indices = []
+            self._resolved_gene_keys = []
+            for h5ad_idx, gene in enumerate(self.h5ad_gene_names):
+                if gene in self.gene_mapping:
+                    self.valid_h5ad_indices.append(h5ad_idx)
+                    self._resolved_gene_keys.append(gene)
 
         self.valid_h5ad_indices = np.array(self.valid_h5ad_indices, dtype=np.int64)
 
         log.info(f"  H5AD genes: {len(self.h5ad_gene_names)}")
         log.info(f"  Gene mapping vocabulary: {len(self.gene_mapping)}")
-        log.info(f"  Genes in common: {len(self.valid_h5ad_indices)}")
+        log.info(f"  Genes in common: {len(self.valid_h5ad_indices)}"
+                 f"{' (case-insensitive)' if self.case_insensitive else ''}")
 
         if len(self.valid_h5ad_indices) == 0:
             raise ValueError("No genes found in common between h5ad file and gene mapping!")
@@ -158,13 +225,15 @@ class H5ADDataset(Dataset):
         self.gene_starts = []
         self.aligned_gene_names = []
 
-        for h5ad_idx in self.valid_h5ad_indices:
-            gene = self.h5ad_gene_names[h5ad_idx]
-            mapping = self.gene_mapping[gene]
+        for i, h5ad_idx in enumerate(self.valid_h5ad_indices):
+            # ``_resolved_gene_keys`` is the vocab-side key; the displayed
+            # name stays as it appeared in the h5ad for downstream sanity.
+            vocab_key = self._resolved_gene_keys[i]
+            mapping = self.gene_mapping[vocab_key]
             self.gene_protein_ids.append(mapping['protein_embedding_id'])
             self.gene_chroms.append(mapping['chromosome_id'])
             self.gene_starts.append(mapping['location'])
-            self.aligned_gene_names.append(gene)
+            self.aligned_gene_names.append(self.h5ad_gene_names[h5ad_idx])
 
         self.gene_protein_ids = np.array(self.gene_protein_ids, dtype=np.int64)
         self.gene_chroms = np.array(self.gene_chroms, dtype=np.int64)
@@ -214,25 +283,35 @@ class H5ADDataset(Dataset):
         return result
 
 
-def load_gene_mapping(gene_mapping_path: str, species: str = "human") -> Dict:
-    """Load gene mapping from JSON file.
+# Aliases bridging dataset-style NCBI binomial species names to the legacy
+# informal keys used in older single-species vocab JSONs. The multi-species
+# vocab JSON keeps the new species (callithrix_jacchus, pan_troglodytes)
+# under their dataset names already, so no alias is needed for those.
+SPECIES_VOCAB_ALIASES: Dict[str, str] = {
+    "homo_sapiens": "human",
+    "mus_musculus": "mouse",
+    "danio_rerio": "zebrafish",
+    "microcebus_murinus": "mouse_lemur",
+    "sus_scrofa": "pig",
+    "sus_scrofa_domesticus": "pig",
+}
 
-    Args:
-        gene_mapping_path: Path to all_species_gene_dict.json
-        species: Species key in the mapping (default: "human")
 
-    Returns:
-        Dictionary mapping gene names to genomic features
-        (protein_embedding_id, chromosome_id, location).
+def load_gene_mapping(gene_mapping_path: str) -> Dict:
+    """Load a gene-mapping JSON.
+
+    Supports both the legacy single-species vocab
+    (``gene_data/human_gene_dict.json``) and the multi-species vocab
+    (``gene_data/all_species_gene_dict_multi_2025-11-08.json``). Returns the
+    raw top-level dict — species selection happens inside
+    :class:`H5ADDataset` (or via ``H5ADDataset(species=...)``).
+
+    The multi-species JSON has 10 top-level species keys:
+        human, mouse, pig, macaca_fascicularis, zebrafish, frog,
+        mouse_lemur, macaca_mulatta, callithrix_jacchus, pan_troglodytes.
     """
     log.info(f"Loading gene mapping from {gene_mapping_path}")
     with open(gene_mapping_path, 'r') as f:
         gene_mapping_data = json.load(f)
-
-    if species in gene_mapping_data:
-        gene_mapping = gene_mapping_data[species]
-    else:
-        raise ValueError(f"Species '{species}' not found in gene mapping. Available: {list(gene_mapping_data.keys())}")
-
-    log.info(f"Loaded {len(gene_mapping)} gene mappings for {species}")
-    return gene_mapping
+    log.info(f"Top-level species keys: {sorted(gene_mapping_data.keys())}")
+    return gene_mapping_data

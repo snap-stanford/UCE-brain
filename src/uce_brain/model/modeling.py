@@ -201,20 +201,6 @@ class UCEPreTrainedModel(PreTrainedModel):
     base_model_prefix = "uce"
     supports_gradient_checkpointing = True
 
-    def _init_weights(self, module):
-        """Initialize the weights."""
-        if isinstance(module, nn.Linear):
-            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range if hasattr(self.config, 'initializer_range') else 0.02)
-            if module.bias is not None:
-                module.bias.data.zero_()
-        elif isinstance(module, nn.Embedding):
-            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range if hasattr(self.config, 'initializer_range') else 0.02)
-            if module.padding_idx is not None:
-                module.weight.data[module.padding_idx].zero_()
-        elif isinstance(module, nn.LayerNorm):
-            module.bias.data.zero_()
-            module.weight.data.fill_(1.0)
-
     def _load_pretrained_embeddings(self,
                                     embedding_weights: torch.Tensor):
         """Load pre-trained embeddings into the embedding layer."""

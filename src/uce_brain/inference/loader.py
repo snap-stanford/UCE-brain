@@ -7,7 +7,7 @@ parameters (``pad_length``, the chromosome-token layout, ...). The last two are
 vocabulary-specific. A legacy model (145k/178k-token vocab, chrom_token_offset
 1000) and a v2026-09 model (266,403 tokens, chrom_token_offset 237411) share
 the architecture but not the tokenisation, and a wrong offset does not raise:
-it silently yields well-formed, meaningless embeddings. Nothing here therefore
+it silently yields well-formed but different embeddings. Nothing here therefore
 carries a hard-coded vocabulary default. The parameters are read from the
 checkpoint (``config.json``, or the training run's ``config.yaml`` shipped next
 to the weights) or passed explicitly by the caller.
@@ -194,7 +194,7 @@ def load_cell_sentence_params(
             f"Could not resolve the cell-sentence parameters {missing} for {checkpoint_dir}.\n"
             f"config.yaml found: {cfg_path if cfg_path else 'none'} (searched:\n  {searched})\n"
             "Inference must tokenise exactly as training did; a mismatch is silent and "
-            "produces plausible-looking but meaningless embeddings. Ship the run's "
+            "produces plausible-looking but different embeddings. Ship the run's "
             "config.yaml next to the weights, store the keys in config.json, or pass "
             "them via `overrides`."
         )

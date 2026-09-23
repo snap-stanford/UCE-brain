@@ -187,6 +187,10 @@ def main() -> int:
             summary["control_wrong_offset"]["knn"][key] = {"acc": res["acc"], "macro_f1": res["macro_f1"]}
             log.info(f"control offset {args.control_chrom_offset} kNN[{key}]: acc={res['acc']:.3f} macroF1={res['macro_f1']:.3f}")
         summary["control_wrong_offset"]["cos_to_correct_mean"] = float(np.mean(np.sum(ctrl * emb, axis=1)))
+        ctrl_loss_ds = build_dataset(adata[:n_loss].copy(), gene_mapping, wrong, args.species, mask_prop=None)
+        ctrl_loss = compute_per_cell_loss(model, ctrl_loss_ds, batch_size=args.batch_size, num_workers=args.num_workers, show_progress=False)
+        summary["control_wrong_offset"]["per_cell_loss_mean"] = float(ctrl_loss.mean())
+        log.info(f"control offset {args.control_chrom_offset} per-cell loss: mean={ctrl_loss.mean():.4f} (correct offset: {loss.mean():.4f})")
 
     summary["checks"] = checks
     summary["all_checks_passed"] = all(checks.values())

@@ -162,6 +162,39 @@ class ProteinEmbeddingLayer(nn.Module):
         return x
 
 
+def _build_input_gene_embedding_projector(
+    embedding_dim: int,
+    d_model: int,
+    projection_type: str = "linear",
+    expansion_factor: int = 4,
+) -> nn.Sequential:
+    """Project frozen protein/gene embeddings into the transformer's input space.
+
+    Modes (mirroring the training code):
+      - "linear": Linear(embedding_dim, d_model) + LayerNorm + GELU. The original
+                  layout; state_dict keys match every checkpoint released so far.
+      - "mlp":    embedding_dim -> d_model -> d_model*expansion_factor -> d_model,
+                  GELU between the Linears and one terminating LayerNorm.
+    """
+    if projection_type == "linear":
+        return nn.Sequential(
+            nn.Linear(embedding_dim, d_model),
+            nn.LayerNorm(d_model),
+            nn.GELU(),
+        )
+    if projection_type == "mlp":
+        hidden_dim = d_model * expansion_factor
+        return nn.Sequential(
+            nn.Linear(embedding_dim, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, d_model),
+            nn.LayerNorm(d_model),
+        )
+    raise ValueError(f"Unknown input_projection_type: {projection_type!r}")
+
+
 class BinaryExpressionDecoder(nn.Module):
     """Binary Expression Decoder for predicting gene expression."""
 
@@ -235,11 +268,13 @@ class UCEModel(UCEPreTrainedModel):
             requires_grad=config.embedding_requires_grad
         )
 
-        # Project embeddings to transformer dimension
-        self.input_gene_embedding_projector = nn.Sequential(
-            nn.Linear(config.embedding_dim, config.d_model),
-            nn.LayerNorm(config.d_model),
-            nn.GELU(),
+        # Project embeddings to transformer dimension. getattr keeps configs
+        # written before these keys existed loadable ("linear" is the original).
+        self.input_gene_embedding_projector = _build_input_gene_embedding_projector(
+            embedding_dim=config.embedding_dim,
+            d_model=config.d_model,
+            projection_type=getattr(config, "input_projection_type", "linear"),
+            expansion_factor=getattr(config, "input_projection_expansion_factor", 4),
         )
 
         # Positional encoding
@@ -264,7 +299,7 @@ class UCEModel(UCEPreTrainedModel):
             dropout=config.dropout,
             activation=config.activation,
             batch_first=True,
-            norm_first=False
+            norm_first=getattr(config, "norm_first", False),
         )
         self.transformer_encoder = nn.TransformerEncoder(
             encoder_layer=encoder_layer,

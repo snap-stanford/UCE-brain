@@ -41,6 +41,14 @@ class UCEConfig(PretrainedConfig):
         decoder_expansion_factors (list, optional): Expansion factors for decoder MLPs. Defaults to [2, 2].
         decoder_dropout (float, optional): Dropout probability for decoder. Defaults to 0.1.
         positional_encoding_type (str, optional): Type of positional encoding ('sinusoidal' or 'learned'). Defaults to "sinusoidal".
+        norm_first (bool, optional): Pre-norm (True) or post-norm (False) transformer layers. Defaults to False.
+        input_projection_type (str, optional): How frozen gene embeddings are projected to d_model:
+            'linear' (Linear + LayerNorm + GELU, the original layout) or 'mlp'. Defaults to "linear".
+        input_projection_expansion_factor (int, optional): Hidden-width multiplier of the 'mlp' projector. Defaults to 4.
+
+    Any extra key in a checkpoint's ``config.json`` is kept as an attribute (PretrainedConfig
+    behaviour). The inference loader uses that to pick up the cell-sentence parameters
+    (``chrom_token_offset``, ``pad_length``, ...) when a checkpoint stores them there.
 
     Example:
         >>> from uce_brain.model import UCEConfig, UCEModel
@@ -73,6 +81,9 @@ class UCEConfig(PretrainedConfig):
         decoder_layer_dims: Optional[list] = None,
         decoder_dropout: float = 0.1,
         positional_encoding_type: str = "sinusoidal",
+        norm_first: bool = False,
+        input_projection_type: str = "linear",
+        input_projection_expansion_factor: int = 4,
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -95,6 +106,12 @@ class UCEConfig(PretrainedConfig):
         self.expansion_factor = expansion_factor
         self.max_sequence_length = max_sequence_length
         self.positional_encoding_type = positional_encoding_type
+        self.norm_first = norm_first
+
+        # Input (gene embedding -> transformer) projection. "linear" keeps the
+        # original nn.Sequential state_dict keys (input_gene_embedding_projector.0/1/2.*).
+        self.input_projection_type = input_projection_type
+        self.input_projection_expansion_factor = input_projection_expansion_factor
 
         # Embedding aggregation configuration
         self.embedding_reduction = embedding_reduction
@@ -114,3 +131,5 @@ class UCEConfig(PretrainedConfig):
         assert self.positional_encoding_type in ['sinusoidal', 'learned'], f"positional_encoding_type must be 'sinusoidal' or 'learned', got {self.positional_encoding_type}"
         assert len(self.decoder_layer_dims) >= 2, "decoder_layer_dims must have at least 2 elements"
         assert self.decoder_layer_dims[-1] == 1, "Last decoder layer dimension must be 1 for binary classification"
+        assert self.input_projection_type in ('linear', 'mlp'), \
+            f"input_projection_type must be 'linear' or 'mlp', got {self.input_projection_type}"

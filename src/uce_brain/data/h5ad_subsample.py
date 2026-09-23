@@ -49,15 +49,29 @@ def _read_dataframe(group: h5py.Group) -> pd.DataFrame:
 
 
 def _read_array_or_categorical(node):
-    """Read either a plain array dataset or an anndata categorical group."""
+    """Read a plain array dataset, an anndata categorical group, or an
+    anndata nullable (``values`` + ``mask``) group."""
     if isinstance(node, h5py.Group):
-        if node.attrs.get("encoding-type", "") == "categorical":
+        encoding = node.attrs.get("encoding-type", "")
+        if encoding == "categorical":
             codes = node["codes"][:]
             cats = _read_array_or_categorical(node["categories"])
             ordered = bool(node.attrs.get("ordered", False))
             return pd.Categorical.from_codes(codes, categories=cats, ordered=ordered)
-        # Generic group: try to read as a dataset under itself, else give up.
-        raise ValueError(f"Unsupported group at {node.name!r}")
+        if encoding in ("nullable-string-array", "nullable-integer", "nullable-boolean"):
+            # anndata >= 0.11 writes string columns (and the obs/var index,
+            # from 0.13) as {values, mask}; mask=True marks a missing entry.
+            values = _read_array_or_categorical(node["values"])
+            mask = node["mask"][:].astype(bool) if "mask" in node else None
+            if mask is not None and mask.any():
+                if encoding == "nullable-string-array":
+                    values = values.astype(object)
+                    values[mask] = None
+                else:
+                    values = pd.array(values, dtype="Int64" if encoding == "nullable-integer" else "boolean")
+                    values[mask] = pd.NA
+            return values
+        raise ValueError(f"Unsupported group at {node.name!r} (encoding-type={encoding!r})")
     arr = node[:]
     # h5py loads strings as bytes; decode for pandas friendliness.
     if arr.dtype.kind == "O" or arr.dtype.kind == "S":

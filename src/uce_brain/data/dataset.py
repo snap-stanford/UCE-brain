@@ -83,28 +83,13 @@ class H5ADDataset(Dataset):
         self.adata = adata
         # Accept either the full multi-species dict (top-level species keys)
         # or a pre-indexed species sub-dict (passed for backward compat).
-        # Detect by checking whether ``species`` is a top-level key.
-        if species in gene_mapping:
-            self.gene_mapping = gene_mapping[species]
+        if is_single_species_mapping(gene_mapping):
+            self.gene_mapping = gene_mapping
             self.species = species
-        elif SPECIES_VOCAB_ALIASES.get(species) in gene_mapping:
-            alias = SPECIES_VOCAB_ALIASES[species]
-            log.info(f"Resolved species alias '{species}' -> '{alias}'")
-            self.gene_mapping = gene_mapping[alias]
-            self.species = alias
         else:
-            # Heuristic: if values look like gene-info dicts (have
-            # protein_embedding_id), assume gene_mapping is already
-            # pre-indexed for a single species.
-            first_value = next(iter(gene_mapping.values()))
-            if isinstance(first_value, dict) and "protein_embedding_id" in first_value:
-                self.gene_mapping = gene_mapping
-                self.species = species
-            else:
-                raise KeyError(
-                    f"Species '{species}' not in gene_mapping. "
-                    f"Top-level keys: {sorted(gene_mapping.keys())}"
-                )
+            # Legacy ("human") and v2026-09 ("homo_sapiens") keys both resolve.
+            self.species = resolve_species_key(species, gene_mapping)
+            self.gene_mapping = gene_mapping[self.species]
         self.pad_length = pad_length
         self.positive_sample_num = positive_sample_num
         self.negative_sample_num = negative_sample_num
@@ -283,32 +268,97 @@ class H5ADDataset(Dataset):
         return result
 
 
-# Aliases bridging dataset-style NCBI binomial species names to the legacy
-# informal keys used in older single-species vocab JSONs. The multi-species
-# vocab JSON keeps the new species (callithrix_jacchus, pan_troglodytes)
-# under their dataset names already, so no alias is needed for those.
-SPECIES_VOCAB_ALIASES: Dict[str, str] = {
+# Species naming differs between vocabularies:
+#   * legacy JSONs (human_gene_dict.json, all_species_gene_dict_multi_2025-11-08.json)
+#     use informal keys: human, mouse, pig, zebrafish, mouse_lemur, frog,
+#     macaca_fascicularis, macaca_mulatta, callithrix_jacchus, pan_troglodytes;
+#   * v2026-09 JSONs use NCBI binomials: homo_sapiens, mus_musculus, ...
+# ``resolve_species_key`` maps either spelling (plus common names) onto
+# whichever key the loaded vocab actually has.
+
+# Any spelling -> canonical NCBI binomial (lower-case, underscore-separated).
+SPECIES_ALIASES: Dict[str, str] = {
+    "human": "homo_sapiens",
+    "mouse": "mus_musculus",
+    "rat": "rattus_norvegicus",
+    "pig": "sus_scrofa",
+    "sus_scrofa_domesticus": "sus_scrofa",
+    "zebrafish": "danio_rerio",
+    "mouse_lemur": "microcebus_murinus",
+    "marmoset": "callithrix_jacchus",
+    "chimp": "pan_troglodytes",
+    "chimpanzee": "pan_troglodytes",
+    "macaque": "macaca_mulatta",
+    "rhesus": "macaca_mulatta",
+    "rhesus_macaque": "macaca_mulatta",
+    # Pig-tailed macaque has no vocabulary of its own; it was trained through
+    # the rhesus entry (vocab_key: macaca_mulatta in the training config).
+    "macaca_nemestrina": "macaca_mulatta",
+    "pigtail_macaque": "macaca_mulatta",
+    "opossum": "monodelphis_domestica",
+    "owl_monkey": "aotus_nancymaae",
+    "tree_shrew": "tupaia_chinensis",
+    "treeshrew": "tupaia_chinensis",
+}
+
+# Canonical binomial -> key used by the legacy vocab JSONs.
+LEGACY_SPECIES_KEYS: Dict[str, str] = {
     "homo_sapiens": "human",
     "mus_musculus": "mouse",
     "danio_rerio": "zebrafish",
     "microcebus_murinus": "mouse_lemur",
     "sus_scrofa": "pig",
-    "sus_scrofa_domesticus": "pig",
 }
+
+# Kept for backward compatibility with code importing the old name.
+SPECIES_VOCAB_ALIASES: Dict[str, str] = dict(LEGACY_SPECIES_KEYS, sus_scrofa_domesticus="pig")
+
+
+def canonical_species(species: str) -> str:
+    """Normalise a species spelling to its NCBI binomial ("Human" -> "homo_sapiens")."""
+    key = species.strip().lower().replace(" ", "_").replace("-", "_")
+    return SPECIES_ALIASES.get(key, key)
+
+
+def resolve_species_key(species: str, gene_mapping: Dict) -> str:
+    """Return the top-level key of ``gene_mapping`` that holds ``species``.
+
+    Tries, in order: the exact key, the canonical binomial, the legacy informal
+    key. Raises ``KeyError`` (listing the available keys) if none matches.
+    """
+    if species in gene_mapping:
+        return species
+    canonical = canonical_species(species)
+    for candidate in (canonical, LEGACY_SPECIES_KEYS.get(canonical)):
+        if candidate is not None and candidate in gene_mapping:
+            log.info(f"Resolved species '{species}' -> vocab key '{candidate}'")
+            return candidate
+    raise KeyError(
+        f"Species '{species}' not in gene_mapping. "
+        f"Top-level keys: {sorted(gene_mapping.keys())}"
+    )
+
+
+def is_single_species_mapping(gene_mapping: Dict) -> bool:
+    """True if ``gene_mapping`` is already ``gene -> features`` (no species level)."""
+    first_value = next(iter(gene_mapping.values()))
+    return isinstance(first_value, dict) and "protein_embedding_id" in first_value
 
 
 def load_gene_mapping(gene_mapping_path: str) -> Dict:
     """Load a gene-mapping JSON.
 
-    Supports both the legacy single-species vocab
-    (``gene_data/human_gene_dict.json``) and the multi-species vocab
-    (``gene_data/all_species_gene_dict_multi_2025-11-08.json``). Returns the
-    raw top-level dict — species selection happens inside
-    :class:`H5ADDataset` (or via ``H5ADDataset(species=...)``).
-
-    The multi-species JSON has 10 top-level species keys:
-        human, mouse, pig, macaca_fascicularis, zebrafish, frog,
-        mouse_lemur, macaca_mulatta, callithrix_jacchus, pan_troglodytes.
+    Supports the legacy single-species vocab (``gene_data/human_gene_dict.json``),
+    the legacy multi-species vocab
+    (``gene_data/all_species_gene_dict_multi_2025-11-08.json``, 10 keys: human,
+    mouse, pig, macaca_fascicularis, zebrafish, frog, mouse_lemur, macaca_mulatta,
+    callithrix_jacchus, pan_troglodytes) and the v2026-09 vocab
+    (``gene_data/all_species_gene_dict_v2026-09.json``, 12 binomial keys:
+    homo_sapiens, mus_musculus, macaca_mulatta, callithrix_jacchus,
+    pan_troglodytes, rattus_norvegicus, monodelphis_domestica, sus_scrofa,
+    aotus_nancymaae, tupaia_chinensis, microcebus_murinus, danio_rerio).
+    Returns the raw top-level dict; species selection happens in
+    :class:`H5ADDataset` via :func:`resolve_species_key`.
     """
     log.info(f"Loading gene mapping from {gene_mapping_path}")
     with open(gene_mapping_path, 'r') as f:

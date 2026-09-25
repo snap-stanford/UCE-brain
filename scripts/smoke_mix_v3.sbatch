@@ -20,9 +20,10 @@ set -euo pipefail
 REPO="${UCE_BRAIN_REPO:-${SLURM_SUBMIT_DIR:-$PWD}}"
 cd "$REPO"
 
-# The v3 weights (KuanP/brain-uce-pilot-mix-v3) are still being uploaded; the
-# staged sibling run (same vocabulary and architecture) stands in until then.
-MODEL="${SMOKE_MODEL:-/dfs/ssd/project/uce-brain/hf_upload/brain-uce-pilot-mix-v2}"
+# Model under test: a Hub repo id (downloaded to the HF cache) or a local checkpoint
+# directory (config.json + model.safetensors + config.yaml), e.g. a local clone of the
+# Hub repo or the training run directory. Override with SMOKE_MODEL.
+MODEL="${SMOKE_MODEL:-KuanP/brain-uce-pilot-mix-v3}"
 GENE_MAPPING="${SMOKE_GENE_MAPPING:-$REPO/gene_data/all_species_gene_dict_v2026-09.json}"
 H5AD="${SMOKE_H5AD:-/dfs/ssd/project/uce-brain/data/eval_data/hmba_v05/macaque/hmba_wb_v0.5_macaca_mulatta_nonoverlap.h5ad}"
 SPECIES="${SMOKE_SPECIES:-macaca_mulatta}"

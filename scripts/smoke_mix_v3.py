@@ -1,6 +1,10 @@
 #!/usr/bin/env python
 """GPU smoke test for a UCE-brain model trained with the v2026-09 vocabulary.
 
+Works for both architecture generations (e.g. ``KuanP/brain-uce-pilot-mix-v3``,
+512-d / 8 layers, and ``KuanP/brain-uce-pilot-mix-v3-d768l14v2``, 768-d / 14
+layers, v2 layout); the expected width is read from the model config.
+
 Loads a checkpoint (Hub repo id or local directory) through
 ``uce_brain.inference``, embeds a random subsample of a real h5ad and checks
 the result: finite values, unit L2 norm, expected width, per-cell training loss

@@ -1,7 +1,10 @@
 """
 Inference helpers: load a checkpoint (local directory or Hugging Face Hub repo
 id) together with the tokenisation parameters it was trained with, and embed
-an AnnData object.
+an AnnData object. The same calls serve every released model, including the
+v2-architecture ``KuanP/brain-uce-pilot-mix-v3-d768l14v2`` (768-d embeddings);
+``load_model`` refuses checkpoints whose architecture this version does not
+implement instead of loading them partially.
 
     from uce_brain.inference import resolve_checkpoint, load_model, load_cell_sentence_params, embed_adata
     from uce_brain.data import load_gene_mapping, read_h5ad_subsampled
@@ -18,16 +21,19 @@ from .embed import build_dataset, compute_per_cell_loss, embed_adata, embed_data
 from .loader import (
     CELL_SENTENCE_KEYS,
     CellSentenceParams,
+    UnsupportedCheckpointError,
     find_gene_mapping,
     find_run_config,
     load_cell_sentence_params,
     load_model,
     resolve_checkpoint,
+    unknown_config_keys,
 )
 
 __all__ = [
     "CELL_SENTENCE_KEYS",
     "CellSentenceParams",
+    "UnsupportedCheckpointError",
     "build_dataset",
     "compute_per_cell_loss",
     "embed_adata",
@@ -37,4 +43,5 @@ __all__ = [
     "load_cell_sentence_params",
     "load_model",
     "resolve_checkpoint",
+    "unknown_config_keys",
 ]

@@ -43,12 +43,56 @@ class UCEConfig(PretrainedConfig):
         positional_encoding_type (str, optional): Type of positional encoding ('sinusoidal' or 'learned'). Defaults to "sinusoidal".
         norm_first (bool, optional): Pre-norm (True) or post-norm (False) transformer layers. Defaults to False.
         input_projection_type (str, optional): How frozen gene embeddings are projected to d_model:
-            'linear' (Linear + LayerNorm + GELU, the original layout) or 'mlp'. Defaults to "linear".
+            'linear' (Linear + LayerNorm + GELU, the original layout), 'linear_gelu_ln'
+            (Linear + GELU + LayerNorm, the public-UCE order; v2) or 'mlp'. Defaults to "linear".
         input_projection_expansion_factor (int, optional): Hidden-width multiplier of the 'mlp' projector. Defaults to 4.
+
+    v2 architecture options (``KuanP/brain-uce-pilot-mix-v3-d768l14v2`` and later). Every
+    default reproduces the original architecture: the same module tree, state-dict keys and
+    forward pass, so configs written before these keys existed load unchanged.
+
+        token_norm (str, optional): Normalisation of the frozen gene token before the input
+            projector (and before the decoder's target-gene layer). 'layernorm' = the original
+            behaviour (a LayerNorm over ``embedding_dim`` iff ``use_embedding_layer_norm``),
+            'l2' = parameter-free L2 normalisation (public UCE), 'none' = raw token.
+            Defaults to "layernorm".
+        token_scaling_sqrt_d (bool, optional): Multiply the projected tokens by sqrt(d_model)
+            before the positional encoding. Defaults to False.
+        pe_scale (float, optional): Multiplier of the sinusoidal positional-encoding table
+            (applied at forward time; the stored ``pe`` buffer is unchanged). Defaults to 1.0.
+        separate_gene_layer (bool, optional): Embed the decoder's target genes with their own
+            Linear + GELU + LayerNorm (``gene_embedding_layer``) instead of the encoder's input
+            projector. Affects the expression-prediction loss only, not cell embeddings.
+            Defaults to False.
+        cell_head_type (str, optional): 'linear_ln' = Linear(d_model, output_embedding_dim) +
+            LayerNorm on every token, CLS taken after (``output_embedding_projector``, the
+            original); 'mlp' = CLS taken first, then ``cell_head``: one Linear + LayerNorm +
+            GELU + Dropout block per width in ``cell_head_dims``, then a plain
+            Linear(last width, output_embedding_dim). Defaults to "linear_ln".
+        cell_head_dims (list, optional): Hidden widths of the 'mlp' cell head. Defaults to None.
+        cell_head_dropout (float, optional): Dropout of the 'mlp' cell head (None = ``dropout``).
+        decoder_input_dropout (bool, optional): Dropout on the decoder input (False puts an
+            nn.Identity in its place, keeping the decoder's Sequential indices). Defaults to True.
+        encoder_impl (str, optional): 'torch' = nn.TransformerEncoder (the original) or 'uce' =
+            the in-repo encoder (``UCEEncoder``), required by the options below. Defaults to "torch".
+        final_norm (bool, optional): Norm after the last encoder layer ('uce' only). Defaults to False.
+        norm_type (str, optional): 'layernorm' or 'rmsnorm' in the 'uce' encoder. Defaults to "layernorm".
+        qk_norm (bool, optional): RMSNorm over head_dim on queries and keys ('uce' only). Defaults to False.
+        ffn_type (str, optional): 'gelu', 'relu' or 'swiglu' feed-forward ('uce' only; the torch
+            encoder uses ``activation``). Defaults to "gelu".
+        encoder_bias (bool, optional): Biases in the 'uce' encoder's Linear and LayerNorm layers.
+            Defaults to True.
+        attn_dropout (float, optional): Attention-probability dropout of the 'uce' encoder
+            (None = ``dropout``).
+        scaled_residual_init (bool, optional): Training-time initialisation option (residual
+            output projections at std / sqrt(2 * num_layers)); stored for completeness, no
+            effect on inference. Defaults to False.
+        layer_norm_eps (float, optional): Epsilon of the 'uce' encoder's norms. Defaults to 1e-5.
 
     Any extra key in a checkpoint's ``config.json`` is kept as an attribute (PretrainedConfig
     behaviour). The inference loader uses that to pick up the cell-sentence parameters
-    (``chrom_token_offset``, ``pad_length``, ...) when a checkpoint stores them there.
+    (``chrom_token_offset``, ``pad_length``, ...) when a checkpoint stores them there, and
+    flags keys it does not recognise (see ``uce_brain.inference.load_model``).
 
     Example:
         >>> from uce_brain.model import UCEConfig, UCEModel
@@ -84,6 +128,24 @@ class UCEConfig(PretrainedConfig):
         norm_first: bool = False,
         input_projection_type: str = "linear",
         input_projection_expansion_factor: int = 4,
+        # v2 options; every default reproduces the original architecture exactly.
+        token_norm: str = "layernorm",
+        token_scaling_sqrt_d: bool = False,
+        pe_scale: float = 1.0,
+        separate_gene_layer: bool = False,
+        cell_head_type: str = "linear_ln",
+        cell_head_dims: Optional[list] = None,
+        cell_head_dropout: Optional[float] = None,
+        decoder_input_dropout: bool = True,
+        encoder_impl: str = "torch",
+        final_norm: bool = False,
+        norm_type: str = "layernorm",
+        qk_norm: bool = False,
+        ffn_type: str = "gelu",
+        encoder_bias: bool = True,
+        attn_dropout: Optional[float] = None,
+        scaled_residual_init: bool = False,
+        layer_norm_eps: float = 1e-5,
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -120,6 +182,25 @@ class UCEConfig(PretrainedConfig):
         # Decoder configuration
         self.decoder_layer_dims = decoder_layer_dims if decoder_layer_dims is not None else [d_model + output_embedding_dim, 512, 512, 1]
         self.decoder_dropout = decoder_dropout
+        self.decoder_input_dropout = bool(decoder_input_dropout)
+
+        # v2 options (see the class docstring)
+        self.token_norm = token_norm
+        self.token_scaling_sqrt_d = bool(token_scaling_sqrt_d)
+        self.pe_scale = float(pe_scale)
+        self.separate_gene_layer = bool(separate_gene_layer)
+        self.cell_head_type = cell_head_type
+        self.cell_head_dims = [int(v) for v in cell_head_dims] if cell_head_dims is not None else None
+        self.cell_head_dropout = cell_head_dropout
+        self.encoder_impl = encoder_impl
+        self.final_norm = bool(final_norm)
+        self.norm_type = norm_type
+        self.qk_norm = bool(qk_norm)
+        self.ffn_type = ffn_type
+        self.encoder_bias = bool(encoder_bias)
+        self.attn_dropout = attn_dropout
+        self.scaled_residual_init = bool(scaled_residual_init)
+        self.layer_norm_eps = float(layer_norm_eps)
 
         # Validate configuration
         self._validate_config()
@@ -131,5 +212,17 @@ class UCEConfig(PretrainedConfig):
         assert self.positional_encoding_type in ['sinusoidal', 'learned'], f"positional_encoding_type must be 'sinusoidal' or 'learned', got {self.positional_encoding_type}"
         assert len(self.decoder_layer_dims) >= 2, "decoder_layer_dims must have at least 2 elements"
         assert self.decoder_layer_dims[-1] == 1, "Last decoder layer dimension must be 1 for binary classification"
-        assert self.input_projection_type in ('linear', 'mlp'), \
-            f"input_projection_type must be 'linear' or 'mlp', got {self.input_projection_type}"
+        assert self.input_projection_type in ('linear', 'linear_gelu_ln', 'mlp'), \
+            f"input_projection_type must be 'linear', 'linear_gelu_ln' or 'mlp', got {self.input_projection_type}"
+        assert self.token_norm in ('layernorm', 'l2', 'none'), f"token_norm: {self.token_norm!r}"
+        assert self.cell_head_type in ('linear_ln', 'mlp'), f"cell_head_type: {self.cell_head_type!r}"
+        if self.cell_head_type == 'mlp':
+            assert self.cell_head_dims, "cell_head_type 'mlp' needs cell_head_dims (hidden widths)"
+        assert self.encoder_impl in ('torch', 'uce'), f"encoder_impl: {self.encoder_impl!r}"
+        assert self.norm_type in ('layernorm', 'rmsnorm'), f"norm_type: {self.norm_type!r}"
+        assert self.ffn_type in ('gelu', 'relu', 'swiglu'), f"ffn_type: {self.ffn_type!r}"
+        if self.encoder_impl == 'torch':
+            # nn.TransformerEncoder has none of these; refuse rather than ignore them.
+            assert not (self.final_norm or self.qk_norm or self.ffn_type != 'gelu' or not self.encoder_bias
+                        or self.norm_type != 'layernorm' or self.scaled_residual_init), \
+                "final_norm / qk_norm / ffn_type / encoder_bias / norm_type / scaled_residual_init need encoder_impl 'uce'"

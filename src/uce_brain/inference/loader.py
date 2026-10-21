@@ -11,8 +11,18 @@ it silently yields well-formed but different embeddings. Nothing here therefore
 carries a hard-coded vocabulary default. The parameters are read from the
 checkpoint (``config.json``, or the training run's ``config.yaml`` shipped next
 to the weights) or passed explicitly by the caller.
+
+The weights have to match the code, too. :func:`load_model` is strict: a
+``config.json`` key this version of ``UCEConfig`` does not define, a tensor in
+``model.safetensors`` the model has no slot for, or a model tensor the file
+does not provide raises (training-only auxiliary heads excepted), because a
+partly loaded or wrongly assembled model still emits finite, unit-norm
+embeddings. The usual cause is a checkpoint written by newer training code
+(a newer model architecture) than this package implements.
 """
 
+import inspect
+import json
 import logging
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -20,6 +30,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import yaml  # installed by transformers / huggingface_hub
+from transformers import PretrainedConfig
 
 from ..model import UCEConfig, UCEForExpressionPrediction
 
@@ -39,6 +50,51 @@ CELL_SENTENCE_KEYS = (
     "chrom_token_right_idx",
     "pad_token_idx",
 )
+
+# Training-only auxiliary heads that a checkpoint may carry next to the model
+# (the Matryoshka runs' per-prefix decoders and their config keys). The
+# embedding path never uses them; they are skipped instead of rejected.
+AUX_TRAINING_HEAD_PREFIXES = ("matryoshka_decoders.",)
+AUX_TRAINING_CONFIG_PREFIXES = ("matryoshka_",)
+
+# config.json keys without architecture meaning that may appear in addition to
+# the UCEConfig arguments and PretrainedConfig's own attributes.
+_BOOKKEEPING_CONFIG_KEYS = frozenset({
+    "architectures", "model_type", "transformers_version", "dtype", "torch_dtype",
+    "use_cache", "_name_or_path", "_commit_hash", "auto_map",
+})
+
+# Generic PretrainedConfig attributes that a ``save_pretrained`` of any supported
+# transformers version can write into config.json: the union of
+# ``PretrainedConfig().to_dict()`` under transformers 4.57.6 (56 keys, including
+# the generation / tokenizer defaults that 5.x dropped) and 5.15.0 (13 keys, a
+# subset). Spelled out so the strict check accepts the same config.json under
+# every transformers version; the installed version's own keys are added at run
+# time on top (see unknown_config_keys).
+_PRETRAINED_CONFIG_KEYS = frozenset({
+    "_name_or_path", "add_cross_attention", "architectures", "bad_words_ids", "begin_suppress_tokens",
+    "bos_token_id", "chunk_size_feed_forward", "cross_attention_hidden_size", "decoder_start_token_id",
+    "diversity_penalty", "do_sample", "dtype", "early_stopping", "encoder_no_repeat_ngram_size",
+    "eos_token_id", "exponential_decay_length_penalty", "finetuning_task", "forced_bos_token_id",
+    "forced_eos_token_id", "id2label", "is_decoder", "is_encoder_decoder", "label2id", "length_penalty",
+    "max_length", "min_length", "model_type", "no_repeat_ngram_size", "num_beam_groups", "num_beams",
+    "num_return_sequences", "output_attentions", "output_hidden_states", "output_scores", "pad_token_id",
+    "prefix", "problem_type", "pruned_heads", "remove_invalid_values", "repetition_penalty", "return_dict",
+    "return_dict_in_generate", "sep_token_id", "suppress_tokens", "task_specific_params", "temperature",
+    "tf_legacy_loss", "tie_encoder_decoder", "tie_word_embeddings", "tokenizer_class", "top_k", "top_p",
+    "torchscript", "transformers_version", "typical_p", "use_bfloat16",
+})
+
+
+class UnsupportedCheckpointError(ValueError, AssertionError):
+    """A checkpoint's ``config.json`` describes a model this uce_brain version cannot build.
+
+    Raised by :func:`load_model` and :func:`load_cell_sentence_params` for
+    ``config.json`` keys this version does not define and for option values
+    ``UCEConfig`` rejects. It subclasses ``ValueError`` and also
+    ``AssertionError``, which is what ``UCEConfig`` validation raised before this
+    check existed, so existing ``except AssertionError`` handlers still catch it.
+    """
 
 # File names of the gene-mapping JSON inside a checkpoint / Hub repo, in the
 # order they are looked for (v2026-09 layout first, then the legacy Hub layout).
@@ -166,7 +222,7 @@ def load_cell_sentence_params(
 
     from_json: Dict[str, Any] = {}
     if (checkpoint_dir / "config.json").is_file():
-        config = UCEConfig.from_pretrained(str(checkpoint_dir))
+        config = _load_config(checkpoint_dir)
         from_json = {k: getattr(config, k) for k in CELL_SENTENCE_KEYS if getattr(config, k, None) is not None}
 
     run_cfg, cfg_path = find_run_config(checkpoint_dir)
@@ -220,58 +276,126 @@ def load_cell_sentence_params(
     return params
 
 
-def _reload_from_safetensors(model: torch.nn.Module, path: Path) -> Tuple[int, int]:
-    """Overwrite every model tensor that differs from ``model.safetensors``.
+def unknown_config_keys(checkpoint_dir: Union[str, Path]) -> List[str]:
+    """``config.json`` keys that this version of :class:`~uce_brain.model.UCEConfig` does not define.
+
+    Known keys are the ``UCEConfig`` arguments, the generic ``PretrainedConfig``
+    attributes (a fixed list covering transformers 4.57 and 5.x, plus whatever
+    the installed version defines), the cell-sentence keys
+    (:data:`CELL_SENTENCE_KEYS`) and a few bookkeeping entries; keys of
+    training-only auxiliary heads (:data:`AUX_TRAINING_CONFIG_PREFIXES`) are
+    ignored. Anything else is most likely an architecture option of newer
+    training code, which this version would silently drop (``PretrainedConfig``
+    keeps unknown keys as inert attributes).
+    """
+    with open(Path(checkpoint_dir) / "config.json") as f:
+        raw = json.load(f)
+    known = set(inspect.signature(UCEConfig.__init__).parameters) - {"self", "kwargs"}
+    known |= _PRETRAINED_CONFIG_KEYS | set(PretrainedConfig().to_dict())
+    known |= set(CELL_SENTENCE_KEYS) | _BOOKKEEPING_CONFIG_KEYS
+    return sorted(k for k in raw if k not in known and not k.startswith(AUX_TRAINING_CONFIG_PREFIXES))
+
+
+def _load_config(checkpoint_dir: Path, unknown_keys: Optional[List[str]] = None) -> UCEConfig:
+    """``UCEConfig.from_pretrained`` with validation failures reported as :class:`UnsupportedCheckpointError`."""
+    try:
+        return UCEConfig.from_pretrained(str(checkpoint_dir))
+    except json.JSONDecodeError:
+        raise
+    except (AssertionError, ValueError) as e:
+        raise UnsupportedCheckpointError(
+            f"{checkpoint_dir / 'config.json'} is not a configuration this uce_brain version supports ({e}). "
+            + _newer_architecture_hint(unknown_keys or [])
+        ) from e
+
+
+def _weight_files(checkpoint_dir: Path) -> List[Path]:
+    """The safetensors weight files of a checkpoint: ``model.safetensors``, or the shards of its index."""
+    single = checkpoint_dir / "model.safetensors"
+    if single.is_file():
+        return [single]
+    index = checkpoint_dir / "model.safetensors.index.json"
+    if index.is_file():
+        with open(index) as f:
+            shards = sorted(set(json.load(f)["weight_map"].values()))
+        return [checkpoint_dir / s for s in shards]
+    return []
+
+
+def _newer_architecture_hint(unknown_keys: List[str]) -> str:
+    keys = f" config.json keys this version does not know: {unknown_keys}." if unknown_keys else ""
+    return (
+        f"The checkpoint was most likely written for a newer model architecture than this uce_brain "
+        f"version implements.{keys} Update UCE-brain (git pull / reinstall) to a version that supports it; "
+        "do not load it with strict=False, which would embed with a partly random or mis-assembled model."
+    )
+
+
+def _reload_from_safetensors(model: torch.nn.Module, paths: List[Path]) -> Tuple[int, int, List[str], List[str]]:
+    """Overwrite every model tensor that differs from the safetensors weights.
 
     ``from_pretrained`` re-initialises submodules after loading on some
     transformers versions (the guard against that has changed across 4.x/5.x),
     and the failure is silent: a model whose transformer weights were reset
-    still produces finite, unit-norm embeddings. Streaming the file tensor by
+    still produces finite, unit-norm embeddings. Streaming the file(s) tensor by
     tensor keeps peak memory at one tensor (the frozen gene table) and yields a
-    diagnostic: the number of tensors that had to be restored.
+    diagnostic: the number of tensors that had to be restored. ``paths`` is
+    ``[model.safetensors]`` or the shards of ``model.safetensors.index.json``.
 
-    Returns ``(n_checked, n_restored)``.
+    Tensors under :data:`AUX_TRAINING_HEAD_PREFIXES` are skipped. A shape
+    mismatch raises here; the caller decides what to do with the rest.
+
+    Returns ``(n_checked, n_restored, missing, unexpected)``: ``missing`` are
+    model tensors absent from the file(s), ``unexpected`` are file tensors
+    (other than auxiliary heads) the model has no slot for.
     """
     from safetensors import safe_open
 
     state = model.state_dict()
     n_checked = n_restored = 0
     unexpected: List[str] = []
+    aux: List[str] = []
     seen = set()
-    with safe_open(str(path), framework="pt", device="cpu") as f:
-        for key in f.keys():
-            if key not in state:
-                unexpected.append(key)
-                continue
-            seen.add(key)
-            target = state[key]
-            tensor = f.get_tensor(key).to(device=target.device, dtype=target.dtype)
-            if tensor.shape != target.shape:
-                raise ValueError(f"{path}: {key} has shape {tuple(tensor.shape)}, model expects {tuple(target.shape)}")
-            n_checked += 1
-            if not torch.equal(target, tensor):
-                with torch.no_grad():
-                    target.copy_(tensor)
-                n_restored += 1
+    for path in paths:
+        with safe_open(str(path), framework="pt", device="cpu") as f:
+            for key in f.keys():
+                if key not in state:
+                    (aux if key.startswith(AUX_TRAINING_HEAD_PREFIXES) else unexpected).append(key)
+                    continue
+                seen.add(key)
+                target = state[key]
+                tensor = f.get_tensor(key).to(device=target.device, dtype=target.dtype)
+                if tensor.shape != target.shape:
+                    raise ValueError(
+                        f"{path}: {key} has shape {tuple(tensor.shape)}, model expects {tuple(target.shape)}. "
+                        "config.json and model.safetensors disagree (or the config describes a newer architecture)."
+                    )
+                n_checked += 1
+                if not torch.equal(target, tensor):
+                    with torch.no_grad():
+                        target.copy_(tensor)
+                    n_restored += 1
     missing = [k for k in state if k not in seen]
-    if missing:
-        log.warning(f"{len(missing)} model tensors are not in {path.name}: {missing[:5]}")
-    if unexpected:
-        log.warning(f"{len(unexpected)} tensors in {path.name} have no counterpart in the model: {unexpected[:5]}")
-    return n_checked, n_restored
+    if aux:
+        log.info(f"Ignoring {len(aux)} auxiliary training-head tensors ({aux[0]} ...)")
+    return n_checked, n_restored, missing, unexpected
 
 
 def load_model(
     checkpoint_dir: Union[str, Path],
     device: Union[str, torch.device] = "cuda",
     dtype: Optional[Union[str, torch.dtype]] = None,
+    strict: bool = True,
 ) -> UCEForExpressionPrediction:
     """Load a :class:`UCEForExpressionPrediction` from a local checkpoint directory.
 
     The directory holds ``config.json`` and ``model.safetensors`` (the layout
     written by ``save_pretrained`` / the HF Trainer and used by the Hub repos;
-    use :func:`resolve_checkpoint` first for a repo id). The frozen gene-token
-    table is part of ``model.safetensors``, so nothing else is needed.
+    use :func:`resolve_checkpoint` first for a repo id; a sharded
+    ``model.safetensors.index.json`` works too). The frozen gene-token table is
+    part of ``model.safetensors``, so nothing else is needed. Both architecture
+    generations load here: the original layout and the v2 layout
+    (``KuanP/brain-uce-pilot-mix-v3-d768l14v2``); ``config.json`` selects it.
 
     Args:
         checkpoint_dir: Directory with ``config.json`` + ``model.safetensors``.
@@ -279,35 +403,77 @@ def load_model(
         dtype: Optional parameter dtype (``torch.bfloat16`` or ``"bfloat16"``).
             Leave ``None`` to keep the stored fp32 weights and rely on autocast
             at embedding time, as training did.
+        strict: Raise (default) when ``config.json`` has keys this version does
+            not define (:class:`UnsupportedCheckpointError`), when the
+            safetensors weights and the model built from ``config.json``
+            disagree on the tensor set (``RuntimeError``; training-only
+            auxiliary heads excepted), or when there are no safetensors weights
+            to check against (``FileNotFoundError``). Each one means the code
+            cannot confirm that it reproduces the trained network, typically
+            because the checkpoint comes from a newer architecture.
+            ``strict=False`` only logs warnings; use it for debugging, not for
+            embeddings.
 
     Returns:
-        The model on ``device`` in ``eval()`` mode.
+        The model on ``device`` in ``eval()`` mode. The gene-token table's
+        ``requires_grad`` follows ``config.embedding_requires_grad`` (False for
+        every released checkpoint: the table is frozen).
     """
     checkpoint_dir = Path(checkpoint_dir)
     if not (checkpoint_dir / "config.json").is_file():
         raise FileNotFoundError(f"No config.json in {checkpoint_dir}")
 
-    config = UCEConfig.from_pretrained(str(checkpoint_dir))
+    unknown = unknown_config_keys(checkpoint_dir)
+    if unknown:
+        msg = f"{checkpoint_dir / 'config.json'} has keys this uce_brain version does not define: {unknown}. "
+        if strict:
+            raise UnsupportedCheckpointError(msg + _newer_architecture_hint([]))
+        log.warning(msg + "They are ignored (strict=False).")
+
+    config = _load_config(checkpoint_dir, unknown)
     log.info(
         f"Loading {checkpoint_dir}: vocab_size={config.vocab_size}, d_model={config.d_model}, "
         f"layers={config.num_layers}, nhead={config.nhead}, output_embedding_dim={config.output_embedding_dim}"
+        + (f", encoder_impl={config.encoder_impl}, cell_head_type={config.cell_head_type}"
+           if config.encoder_impl != "torch" or config.cell_head_type != "linear_ln" else "")
     )
     model = UCEForExpressionPrediction.from_pretrained(str(checkpoint_dir))
 
-    weights = checkpoint_dir / "model.safetensors"
-    if weights.is_file():
-        n_checked, n_restored = _reload_from_safetensors(model, weights)
-        log.info(f"Verified {n_checked} tensors against {weights.name}; restored {n_restored}")
+    weights = _weight_files(checkpoint_dir)
+    if weights:
+        source = weights[0].name if len(weights) == 1 else f"{len(weights)} safetensors shards"
+        n_checked, n_restored, missing, unexpected = _reload_from_safetensors(model, weights)
+        problems = []
+        if unexpected:
+            problems.append(f"{len(unexpected)} tensor(s) in {source} have no counterpart in the model "
+                            f"built from config.json (first: {unexpected[:5]})")
+        if missing:
+            problems.append(f"{len(missing)} model tensor(s) are not in {source} and would keep their "
+                            f"random initialisation (first: {missing[:5]})")
+        if problems:
+            msg = f"{checkpoint_dir}: " + "; ".join(problems) + ". "
+            if strict:
+                raise RuntimeError(msg + _newer_architecture_hint(unknown))
+            log.warning(msg + "Continuing because strict=False.")
+        log.info(f"Verified {n_checked} tensors against {source}; restored {n_restored}")
     else:
-        log.warning(
-            f"No single model.safetensors in {checkpoint_dir}; relying on from_pretrained alone. "
-            "If the per-cell loss sits at ln 2 = 0.693, the trained weights did not survive loading."
-        )
+        msg = (f"No model.safetensors (or model.safetensors.index.json) in {checkpoint_dir}, so the loaded "
+               "tensors cannot be checked against the stored weights. ")
+        if strict:
+            raise FileNotFoundError(msg + "Convert the weights to safetensors, or pass strict=False to rely on "
+                                    "from_pretrained alone.")
+        log.warning(msg + "Relying on from_pretrained alone (strict=False). If the per-cell loss sits at "
+                    "ln 2 = 0.693, the trained weights did not survive loading.")
+
+    # from_pretrained does not keep the constructor's requires_grad on the frozen gene-token table.
+    model.uce.embedding_layer.embedding.weight.requires_grad_(bool(config.embedding_requires_grad))
 
     if dtype is not None:
         if isinstance(dtype, str):
             dtype = getattr(torch, dtype)
         model = model.to(dtype)
     model = model.to(device).eval()
-    log.info(f"Model ready on {device} ({sum(p.numel() for p in model.parameters()):,} parameters)")
+    n_params = sum(p.numel() for p in model.parameters())
+    n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    log.info(f"Model ready on {device} ({n_params:,} parameters, {n_trainable:,} trainable)")
     return model

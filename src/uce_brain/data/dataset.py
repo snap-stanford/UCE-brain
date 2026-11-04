@@ -55,6 +55,11 @@ class H5ADDataset(Dataset):
         """
         Initialize the H5AD dataset.
 
+        The tokenisation defaults below are those of the three older (pre-v2026-09)
+        models: 1,024 genes, pad 2,048, chromosome offset 1000. For any checkpoint, build
+        the dataset with ``uce_brain.inference.build_dataset(adata, gene_mapping,
+        load_cell_sentence_params(ckpt), species)`` instead.
+
         Args:
             adata: The AnnData object to use for the dataset
             gene_mapping: Dictionary mapping gene names to genomic features

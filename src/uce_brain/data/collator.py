@@ -16,7 +16,17 @@ class UCEDataCollator:
 
     The samples are already processed by H5ADDataset.__getitem__() which calls
     sample_cell_sentences_mapping_gene(). This collator just stacks them into batches.
+
+    ``trim_to_multiple`` (default 0 = off): drop the trailing all-padding columns of
+    the batch, keeping ``min(pad_length, ceil(longest sentence / m) * m)`` positions.
+    Padding is a suffix and padded positions are masked out of attention, so for a
+    CLS-pooled model (all released ones) the cell embedding and the loss are
+    unchanged up to floating-point rounding, while the cost falls with the real
+    sentence length. A mean-pooled model averages over the padding, so
+    :func:`~uce_brain.inference.embed_dataset` does not trim for it.
     """
+
+    trim_to_multiple: int = 0
 
     def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         """
@@ -34,7 +44,7 @@ class UCEDataCollator:
 
         Returns:
             Dictionary with batched tensors:
-                - "input_ids": Gene sequences [batch_size, pad_length]
+                - "input_ids": Gene sequences [batch_size, pad_length] (fewer columns with trim_to_multiple)
                 - "attention_mask": Inverted padding mask [batch_size, pad_length]
                 - "target_expression": Expression labels [batch_size, P+N]
                 - "target_gene_ids": Protein embedding indices [batch_size, P+N]
@@ -44,6 +54,12 @@ class UCEDataCollator:
         # Stack tensors, removing the batch dimension of 1 from each sample
         input_ids = torch.cat([sample["batch_sentences"] for sample in batch], dim=0)
         padding_mask = torch.cat([sample["mask"] for sample in batch], dim=0)
+        if self.trim_to_multiple and self.trim_to_multiple > 0:
+            m = int(self.trim_to_multiple)
+            longest = int((~padding_mask).sum(dim=1).max().item())
+            keep = min(input_ids.shape[1], max(m, -(-longest // m) * m))
+            input_ids = input_ids[:, :keep].contiguous()
+            padding_mask = padding_mask[:, :keep].contiguous()
         gene_ids = torch.cat([sample["cell_outputs_X_pe"] for sample in batch], dim=0)
         labels = torch.cat([sample["cell_outputs_Y"] for sample in batch], dim=0)
 

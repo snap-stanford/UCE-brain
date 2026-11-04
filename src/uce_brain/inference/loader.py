@@ -215,7 +215,8 @@ def load_cell_sentence_params(
     positive_sample_num=100, negative_sample_num=100, mask_prop=0.0,
     cls_token_idx=1, pad_token_idx=0, chrom_token_right_idx=2000,
     chrom_token_offset=1000)`` (the :class:`~uce_brain.data.H5ADDataset`
-    defaults used by the legacy notebooks).
+    defaults used by the legacy notebooks). An override that differs from a
+    value stored with the checkpoint (other than ``mask_prop``) logs a warning.
     """
     checkpoint_dir = Path(checkpoint_dir)
     overrides = dict(overrides or {})
@@ -233,6 +234,12 @@ def load_cell_sentence_params(
     missing: List[str] = []
     for key in CELL_SENTENCE_KEYS:
         if overrides.get(key) is not None:
+            stored = from_json[key] if key in from_json else from_yaml.get(key)
+            if stored is not None and key != "mask_prop" and overrides[key] != stored:
+                log.warning(
+                    f"Override {key}={overrides[key]!r} replaces the checkpoint's {key}={stored!r}; "
+                    "the model will not see the sentences it was trained on."
+                )
             resolved[key] = overrides[key]
             sources.append("overrides")
         elif from_json.get(key) is not None:

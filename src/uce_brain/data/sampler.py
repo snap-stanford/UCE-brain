@@ -5,6 +5,8 @@ This module provides functions to convert single-cell expression data into
 structured genomic sequences that preserve chromosome organization.
 """
 
+import warnings
+
 import torch
 import numpy as np
 
@@ -47,7 +49,9 @@ def sample_cell_sentences_mapping_gene(
         gene_protein_ids: Protein embedding IDs for each gene of shape [num_genes].
         gene_chroms: Chromosome IDs for each gene of shape [num_genes].
         gene_starts: Genomic start positions for each gene of shape [num_genes].
-        pad_length: Maximum sequence length for padding.
+        pad_length: Maximum sequence length for padding. A longer sentence is
+            truncated to this length (see the overflow guard below) and a
+            ``RuntimeWarning`` is issued.
         positive_sample_num: Number of expressed genes to sample for positive examples.
         negative_sample_num: Number of non-expressed genes to sample for negative examples.
         mask_prop: Proportion of expressed genes to mask during sequence generation.
@@ -82,6 +86,7 @@ def sample_cell_sentences_mapping_gene(
     chroms = gene_chroms
     starts = gene_starts
     longest_seq_len = 0
+    n_truncated = 0
 
     for c, cell in enumerate(counts):
         pos_genes = torch.where(counts[c] > 0)[0]
@@ -140,7 +145,19 @@ def sample_cell_sentences_mapping_gene(
         else:
             np.random.shuffle(uq_chroms)
 
+        # [CLS] + sample_size genes + a start and an end token per chromosome
+        if 1 + sample_size + 2 * len(uq_chroms) > pad_length:
+            n_truncated += 1
+
         for chrom in uq_chroms:
+            # Overflow guard (same rule as the training suite). The sentence is
+            # [CLS] + sample_size genes + two tokens per chromosome, which can
+            # exceed pad_length on scaffold-heavy genomes (many chromosome ids).
+            # Whole blocks are kept while they fit, the first block that does not
+            # fit is truncated (keeping its end token) and the rest is dropped.
+            # A sentence that fits is unchanged, and no random numbers are drawn here.
+            if i >= pad_length - 2:  # no room for a start token, one gene and the end token
+                break
             ordered_choice_idx[i] = int(chrom) + chrom_token_offset
             i += 1
 
@@ -149,8 +166,9 @@ def sample_cell_sentences_mapping_gene(
             sort_by_start = np.argsort(choosen_starts[loc])
             to_add = choice_idx[loc[sort_by_start]]
 
-            ordered_choice_idx[i:(i + len(to_add))] = dataset_idxs[to_add]
-            i += len(to_add)
+            n_fit = min(len(to_add), pad_length - 1 - i)  # keep one slot for the end token
+            ordered_choice_idx[i:(i + n_fit)] = dataset_idxs[to_add[:n_fit]]
+            i += n_fit
 
             ordered_choice_idx[i] = chrom_token_right_idx
             i += 1
@@ -193,6 +211,16 @@ def sample_cell_sentences_mapping_gene(
         cell_outputs_X[c] = torch.tensor(np.concatenate((choice_idx_output_p, choice_idx_output_n)), dtype=torch.long)
 
         cell_outputs_Y[c] = torch.cat((torch.ones(positive_sample_num, dtype=torch.float32), torch.zeros(negative_sample_num, dtype=torch.float32)))
+
+    if n_truncated:
+        # constant text, so the default warning filter shows it once per process
+        warnings.warn(
+            f"A cell sentence was longer than pad_length={pad_length} and was truncated as in training "
+            "(whole chromosome blocks kept while they fit). This happens for rare cells of genomes "
+            "with many chromosome / scaffold ids, such as tree shrew.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
 
     cell_sentences_pe = cell_sentences.long()
 

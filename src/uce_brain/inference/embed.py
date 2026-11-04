@@ -75,19 +75,43 @@ def _autocast(device: torch.device, bf16: bool):
     return contextlib.nullcontext()
 
 
-def _dataloader(dataset: H5ADDataset, batch_size: int, num_workers: int) -> DataLoader:
+def _dataloader(dataset: H5ADDataset, batch_size: int, num_workers: int, trim_to_multiple: int = 0) -> DataLoader:
     return DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        collate_fn=UCEDataCollator(),
+        collate_fn=UCEDataCollator(trim_to_multiple=trim_to_multiple),
         pin_memory=torch.cuda.is_available(),
     )
 
 
 def _model_device(model: torch.nn.Module) -> torch.device:
     return next(model.parameters()).device
+
+
+def _check_inputs(model: UCEForExpressionPrediction, dataset: H5ADDataset, trim_to_multiple: int) -> int:
+    """Warn when ``dataset`` was not tokenised for ``model``; return the padding trim to apply.
+
+    Only logs; it never changes a result. Every released checkpoint was trained with
+    ``pad_length == max_sequence_length``, so a mismatch almost always means the dataset
+    was not built from the checkpoint's parameters (e.g. the :class:`H5ADDataset`
+    defaults, which are the legacy 1,024-gene / 2,048-token tokenisation).
+    """
+    pad_length = getattr(dataset, "pad_length", None)
+    context = getattr(model.config, "max_sequence_length", None)
+    if pad_length is not None and context is not None and pad_length != context:
+        log.warning(
+            f"The dataset's pad_length ({pad_length}) differs from the model's context "
+            f"(max_sequence_length={context}), so it was probably not tokenised as in training. "
+            "Build it with build_dataset(adata, gene_mapping, load_cell_sentence_params(ckpt), species)."
+        )
+    reduction = getattr(model.config, "embedding_reduction", "cls")
+    if trim_to_multiple and reduction != "cls":
+        log.warning(f"trim_to_multiple is ignored for embedding_reduction={reduction!r}: "
+                    "mean pooling averages over the padding, so trimming would change the result.")
+        return 0
+    return trim_to_multiple
 
 
 @torch.inference_mode()
@@ -98,20 +122,30 @@ def embed_dataset(
     num_workers: int = 4,
     bf16: bool = True,
     show_progress: bool = True,
+    trim_to_multiple: int = 0,
 ) -> np.ndarray:
     """Cell embeddings for every cell of ``dataset``, in dataset order.
 
     The model L2-normalises the CLS output, so rows have unit norm and dot
     products are cosine similarities. ``bf16`` enables bf16 autocast on CUDA
-    (the precision used in training).
+    (the precision used in training). ``trim_to_multiple`` (e.g. 256; default
+    0 = off) drops the all-padding columns of each batch (see
+    :class:`~uce_brain.data.UCEDataCollator`). It saves time when the sentences
+    fill only part of ``pad_length`` (human or macaque data) and little on
+    genomes with many chromosome ids (tree shrew). It applies to CLS-pooled
+    models (all released ones) and is ignored for mean pooling. Results agree
+    with the untrimmed ones up to floating-point rounding; they were bitwise
+    identical in our A100 tests, but that is not guaranteed on every GPU or
+    torch build.
 
     Returns:
         ``float32 [n_cells, output_embedding_dim]``.
     """
+    trim_to_multiple = _check_inputs(model, dataset, trim_to_multiple)
     device = _model_device(model)
     embeddings, indices = [], []
     with _autocast(device, bf16):
-        for batch in tqdm(_dataloader(dataset, batch_size, num_workers), desc="Extracting embeddings", disable=not show_progress):
+        for batch in tqdm(_dataloader(dataset, batch_size, num_workers, trim_to_multiple), desc="Extracting embeddings", disable=not show_progress):
             out = model.extract_cell_embeddings(
                 input_ids=batch["input_ids"].to(device, non_blocking=True),
                 attention_mask=batch["attention_mask"].to(device, non_blocking=True),
@@ -136,6 +170,7 @@ def compute_per_cell_loss(
     num_workers: int = 4,
     bf16: bool = True,
     show_progress: bool = True,
+    trim_to_multiple: int = 0,
 ) -> np.ndarray:
     """Per-cell expression-prediction loss (the training objective), in dataset order.
 
@@ -143,11 +178,13 @@ def compute_per_cell_loss(
     non-expressed target genes. Chance is ``ln 2 = 0.693``; a trained model scores
     well below that, so this is the quickest check that weights and tokenisation
     line up. Build the dataset with the training ``mask_prop`` (``mask_prop=None``).
+    ``trim_to_multiple`` as in :func:`embed_dataset`.
     """
+    trim_to_multiple = _check_inputs(model, dataset, trim_to_multiple)
     device = _model_device(model)
     losses, indices = [], []
     with _autocast(device, bf16):
-        for batch in tqdm(_dataloader(dataset, batch_size, num_workers), desc="Scoring cells", disable=not show_progress):
+        for batch in tqdm(_dataloader(dataset, batch_size, num_workers, trim_to_multiple), desc="Scoring cells", disable=not show_progress):
             out = model(
                 input_ids=batch["input_ids"].to(device, non_blocking=True),
                 attention_mask=batch["attention_mask"].to(device, non_blocking=True),
@@ -178,6 +215,7 @@ def embed_adata(
     gene_symbol_column: Optional[str] = None,
     use_raw: bool = False,
     show_progress: bool = True,
+    trim_to_multiple: int = 0,
 ) -> np.ndarray:
     """:func:`build_dataset` + :func:`embed_dataset` in one call.
 
@@ -194,4 +232,5 @@ def embed_adata(
         gene_symbol_column=gene_symbol_column,
         use_raw=use_raw,
     )
-    return embed_dataset(model, dataset, batch_size=batch_size, num_workers=num_workers, bf16=bf16, show_progress=show_progress)
+    return embed_dataset(model, dataset, batch_size=batch_size, num_workers=num_workers, bf16=bf16,
+                         show_progress=show_progress, trim_to_multiple=trim_to_multiple)

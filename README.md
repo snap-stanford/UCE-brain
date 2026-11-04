@@ -32,7 +32,10 @@ adata.obsm["X_uce"] = embed_adata(model, adata, gene_mapping, params, species="h
 
 - **Input.** `embed_adata` expects raw UMI counts. If `adata.X` holds normalised values and the counts are in `adata.raw`, pass `use_raw=True`. Gene symbols are read from `var_names`, or from `var["feature_name"]` when `var_names` are Ensembl ids (or pass `gene_symbol_column`).
 - **Species.** `species` takes a key of the gene dictionary or a common alias: `human` / `homo_sapiens`, `mouse` / `mus_musculus`, `macaque` / `macaca_mulatta`, `marmoset` / `callithrix_jacchus`, `chimp`, `rat`, `pig`, `zebrafish`, `mouse_lemur`, `opossum`, `owl_monkey`, `tree_shrew`.
-- **Tokenisation.** Always take the tokenisation settings from the checkpoint with `load_cell_sentence_params`, as above. A wrong setting does not raise an error; it only gives slightly worse embeddings.
+- **Tokenisation.** Always take the tokenisation settings from the checkpoint with `load_cell_sentence_params`, as above. A wrong setting does not raise an error (a `pad_length` that does not match the model only logs a warning); it gives worse embeddings.
+- **2,048-gene model.** `KuanP/brain-uce-pilot-mix-v3-d768l14v2-s2048-bican` works with the same calls: `load_cell_sentence_params` reads its longer sentences (2,048 sampled genes, up to 3,584 tokens) from the checkpoint. Do not override `sample_size` or `pad_length` for it. It takes about 2.1x the time per cell of the 1,024-gene models (14.3 vs 6.8 ms on one A100, batch 32).
+- **Faster embedding.** Passing `trim_to_multiple=256` to `embed_adata` skips the unused padding. On human and macaque data it made every model 1.6-1.8x faster with identical embeddings in our tests. It gives little or no gain on genomes with many chromosome ids, such as tree shrew, whose sentences nearly fill `pad_length`.
+- **Long sentences.** A sentence longer than `pad_length` is truncated as in training, with a warning. This happens for rare tree-shrew cells with the 1,024-gene models; earlier versions raised `IndexError` on them.
 - **Gene dictionary.** Use the dictionary listed for the model in the table below. The Hub repos of the v2026-09 models also ship it under `vocab/`, and `uce_brain.inference.find_gene_mapping(ckpt)` locates it.
 
 ## Demo
@@ -51,6 +54,7 @@ Then set `H5AD_PATH` in the notebook's first code cell to the downloaded file.
 
 | Model | Layers / width | Embedding | Gene dictionary | Trained on |
 |---|---|---|---|---|
+| [`KuanP/brain-uce-pilot-mix-v3-d768l14v2-s2048-bican`](https://huggingface.co/KuanP/brain-uce-pilot-mix-v3-d768l14v2-s2048-bican) | 14 / 768 | 768-d | `all_species_gene_dict_v2026-09.json` | 2,048 sampled genes per cell; the 2,048-gene version of the -bican model |
 | [`KuanP/brain-uce-pilot-mix-v3-d768l14v2-bican`](https://huggingface.co/KuanP/brain-uce-pilot-mix-v3-d768l14v2-bican) | 14 / 768 | 768-d | `all_species_gene_dict_v2026-09.json` | the model below, further trained on BICAN brain data |
 | [`KuanP/brain-uce-pilot-mix-v3-d768l14v2`](https://huggingface.co/KuanP/brain-uce-pilot-mix-v3-d768l14v2) | 14 / 768 | 768-d | `all_species_gene_dict_v2026-09.json` | 13 species, brain-weighted mixture (data mix v3) |
 | [`KuanP/brain-uce-pilot-mix-v3`](https://huggingface.co/KuanP/brain-uce-pilot-mix-v3) | 8 / 512 | 512-d | `all_species_gene_dict_v2026-09.json` | 13 species, brain-weighted mixture (data mix v3) |
@@ -59,7 +63,7 @@ Then set `H5AD_PATH` in the notebook's first code cell to the downloaded file.
 | [`KuanP/uce-cxg-2025-baseline-8l-512d`](https://huggingface.co/KuanP/uce-cxg-2025-baseline-8l-512d) | 8 / 512 | 512-d | `human_gene_dict.json` | human CellxGene data (2025) |
 | [`KuanP/uce-brain-pilot-8l-512d`](https://huggingface.co/KuanP/uce-brain-pilot-8l-512d) | 8 / 512 | 512-d | `human_gene_dict.json` | human brain organoid data |
 
-All gene dictionaries are in `gene_data/`. The four v2026-09 models share one vocabulary and use full species names such as `homo_sapiens`. The three older models use their own vocabularies and short species keys such as `human`. The multi-species notebooks (`notebooks/visualize_embeddings_{marmoset,mouse}_multispecies.ipynb`) show `uce-multispecies-2025-11-08`.
+All gene dictionaries are in `gene_data/`. The five v2026-09 models share one vocabulary and use full species names such as `homo_sapiens`. The three older models use their own vocabularies and short species keys such as `human`. The multi-species notebooks (`notebooks/visualize_embeddings_{marmoset,mouse}_multispecies.ipynb`) show `uce-multispecies-2025-11-08`.
 
 ## Checking a checkpoint
 
